@@ -19,7 +19,8 @@ from steve import STEVE
 from data import GlobVideoDataset, SAYCAMDataset
 from utils import cosine_anneal, linear_warmup
 
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cpu')  # Force to use CPU for debugging
 
 parser = argparse.ArgumentParser()
 
@@ -65,6 +66,7 @@ parser.add_argument('--tau_steps', type=int, default=30000)
 parser.add_argument('--hard', action='store_true')
 parser.add_argument('--use_dp', default=False, action='store_true')
 parser.add_argument('--local', default=False, action='store_true')
+parser.add_argument('--dev', default=False, action='store_true')
 
 args = parser.parse_args()
 

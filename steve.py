@@ -209,7 +209,15 @@ class CVCL_VISION_ENCODER(nn.Module):
     def __init__(self):
         super().__init__()
         cvcl, preprocess = MultiModalLitModel.load_model(model_name="cvcl")
-        # self.cvcl = cvcl.to('cpu')
+
+        cvcl.vision_encoder.model.maxpool = nn.Identity()  # remove maxpool layer
+        blk3 = cvcl.vision_encoder.model.layer3[0]
+        blk3.conv2.stride = (1, 1)  # change stride to 1 for layer3
+        blk3.downsample[0].stride = (1, 1)  # change stride to 1 for downsample in layer3
+        blk4 = cvcl.vision_encoder.model.layer4[0]
+        blk4.conv2.stride = (1, 1)  # change stride to 1 for layer4
+        blk4.downsample[0].stride = (1, 1)  # change stride to 1 for downsample in layer4
+
         self.cvcl = cvcl
         self.preprocess = preprocess
     def forward(self, x):
@@ -326,27 +334,20 @@ class STEVE(nn.Module):
         #backbone pretrained model(new class)
         self.backbone = CVCL_VISION_ENCODER()
 
-        #transition model(new class)
-        # self.transition = TransitionModule(args)
-
         # deconv
         self.deconvDVAE = Deconv(args, up_factor = 8)
         self.deconvCNN = Deconv(args, up_factor = 16)
 
 
     def forward(self, video, tau, hard):
-        # def debug_device(t, name):
-        #     # if t is None:
-        #     #     print(name, 'None')
-        #     # else:
-        #         print(name, t.device)
-
-        # param = next(iter(self.deconvDVAE.layer1.parameters()), None)
-        # debug_device(param, 'layer1.weight')
         B, T, C, H, W = video.size()
 
         video_flat = video.flatten(end_dim=1)                               # B * T, C, H, W
+        print(video_flat.shape)
         cvcl_feats = self.backbone(video_flat)                            # B * T, 2048, 4, 4 
+        print(cvcl_feats.shape)
+        import sys
+        sys.exit(0)
 
         # dvae encode
         cvcl_dvae = self.deconvDVAE(cvcl_feats)                                  # B * T, 2048, 32, 32
@@ -459,3 +460,69 @@ class STEVE(nn.Module):
         recon_transformer = recon_transformer.reshape(B, T, C, H, W)
 
         return recon_transformer
+    
+    def visual_cvcl(self, video):
+        B, T, C, H, W = video.size()
+
+        video_flat = video.flatten(end_dim=1)                               # B * T, C, H, W
+        feats = self.backbone(video_flat)                            # B * T, 2048, 32, 32
+        orig_img_np =  video_flat[0].permute(1, 2, 0).cpu().numpy()  # shape = [H, W, C]
+        import numpy as np
+        from scipy.spatial.distance import cdist
+        import matplotlib.pyplot as plt
+        from PIL import Image
+        import os
+
+        feat = feats[0]
+        D, H, W = feat.shape
+        feats = feat.view(D, -1).permute(1,0).cpu().numpy()  # shape = [1024,2048]
+
+        def kmeans_plus_plus(X, K):
+            # X: (N,D)
+            N, _ = X.shape
+            centers = []
+            # 随机选一个初始中心
+            idx = np.random.choice(N)
+            centers.append(X[idx])
+            for _ in range(1, K):
+                # 计算每个点到已有 centers 的最小距离平方
+                d2 = np.min(cdist(X, np.stack(centers)), axis=1)
+                probs = d2 / d2.sum()
+                idx = np.random.choice(N, p=probs)
+                centers.append(X[idx])
+            return np.stack(centers)  # (K,D)
+        
+        K = 10
+        centers = kmeans_plus_plus(feats, K)
+        dists = cdist(feats, centers)  # shape = [1024, K]
+        labels = np.argmin(dists, axis=1)  # shape = [1024,]
+        label_map = labels.reshape(H, W)
+
+        label_up = np.repeat(np.repeat(label_map, 4, axis=0), 4, axis=1)
+
+        # 2. 构造彩色覆盖图
+        cmap = plt.get_cmap('tab20', K)
+        colors = cmap(label_up)            # RGBA, shape = [128,128,4]
+        colors_rgb = (colors[...,:3] * 255).astype(np.uint8)
+
+        # 3. 原图转 uint8
+        orig_uint8 = (orig_img_np * 255).astype(np.uint8)
+
+        # 4. 用 PIL 叠加
+        orig_img_pil = Image.fromarray(orig_uint8)
+        overlay_pil  = Image.blend(orig_img_pil, Image.fromarray(colors_rgb), alpha=0.5)
+
+        # 5. 保存
+        save_path = "/mnt/data/overlay_cluster_sample0.png"
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        overlay_pil.save(save_path)
+
+        print(f"已将叠加可视化结果保存到：{save_path}")
+
+        # plt.figure(figsize=(4,4))
+        # plt.imshow(label_map, cmap='tab20', interpolation='nearest')
+        # plt.axis('off')
+        # plt.title(f"Sample 0, K={K} 聚类结果")
+        # plt.savefig("/home/wz3008/baby_objectcentric/image/", dpi=300, bbox_inches='tight')
+        # plt.close() 
+

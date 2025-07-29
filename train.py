@@ -20,8 +20,6 @@ from data import GlobVideoDataset, SAYCAMDataset
 from utils import cosine_anneal, linear_warmup
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-# print("CUDA available:", torch.cuda.is_available())
-# print("Current device:", torch.cuda.current_device(), torch.cuda.get_device_name(0))
 
 parser = argparse.ArgumentParser()
 
@@ -66,6 +64,7 @@ parser.add_argument('--tau_steps', type=int, default=30000)
 
 parser.add_argument('--hard', action='store_true')
 parser.add_argument('--use_dp', default=False, action='store_true')
+parser.add_argument('--local', default=False, action='store_true')
 
 args = parser.parse_args()
 
@@ -79,8 +78,13 @@ writer.add_text('hparams', arg_str)
 
 # train_dataset = GlobVideoDataset(root=args.data_path, phase='train', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
 # val_dataset = GlobVideoDataset(root=args.data_path, phase='val', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
-train_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "train",128)
-val_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "val",128)
+if not args.local:
+    train_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "train",128)
+    val_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "val",128)
+else:
+    DATA_DIR = "/mnt/wwn-0x5000c500e421004a/yy2694/datasets/train_5fps"
+    train_dataset = SAYCAMDataset(img_dir=DATA_DIR,json_path="/home/wz3008/steve/", phase="train",img_size=128)
+    val_dataset = SAYCAMDataset(img_dir=DATA_DIR,json_path="/home/wz3008/steve/", phase="val",img_size=128)
 
 loader_kwargs = {
     'batch_size': args.batch_size,

@@ -3,7 +3,9 @@ from utils import *
 from dvae import dVAE
 from transformer import TransformerEncoder, TransformerDecoder
 from multimodal.multimodal_lit import MultiModalLitModel
-
+from networks import MLPDecoder
+from sklearn.cluster import KMeans
+import faiss
 
 class SlotAttentionVideo(nn.Module):
     
@@ -12,7 +14,8 @@ class SlotAttentionVideo(nn.Module):
                  num_predictor_blocks=1,
                  num_predictor_heads=4,
                  dropout=0.1,
-                 epsilon=1e-8):
+                 epsilon=1e-8,
+                 kmeans_init=False):
         super().__init__()
         
         self.num_iterations = num_iterations
@@ -46,12 +49,40 @@ class SlotAttentionVideo(nn.Module):
             linear(mlp_hidden_size, slot_size))
         self.predictor = TransformerEncoder(num_predictor_blocks, slot_size, num_predictor_heads, dropout)
 
-    def forward(self, inputs):
+        self.h_map = nn.Linear(2048, slot_size, bias=False)
+        self.kmeans_init = kmeans_init
+
+    def forward(self, inputs, pre_feats): #inputs: B, T, H * W, cnn_hidden_size
         B, T, num_inputs, input_size = inputs.size()
 
         # initialize slots
-        slots = inputs.new_empty(B, self.num_slots, self.slot_size).normal_()
-        slots = self.slot_mu + torch.exp(self.slot_log_sigma) * slots
+        if not self.kmeans_init:
+            slots = inputs.new_empty(B, self.num_slots, self.slot_size).normal_()     #在和inputs同样的设备上创建一个形状为(B, num_slots, slot_size)的张量，并用正态分布初始化
+            slots = self.slot_mu + torch.exp(self.slot_log_sigma) * slots
+        else:
+            # cvcl_feats:B,T,2048,32,32 -> B,1024,2048 -> B, 1024, 2048 -> B, num_slots, slot_size
+            feat0 = pre_feats[:, 0]                                # B,2048,32,32
+            B, C, H, W = feat0.shape
+            h0 = feat0.view(B,C,H*W).permute(0,2,1)                # B, H*W, C
+            h0_mapped = self.h_map(h0)                             # B, H*W, slot_size
+            def kmeans_faiss(x:torch.Tensor, K:int, niter:int=20):
+                assert x.dtype == torch.float32
+                xp = x.cpu().contiguous().numpy()  # convert to numpy
+                d = xp.shape[1]
+                kmeans = faiss.Kmeans(d, K, niter=niter, gpu=True)  # use GPU
+                kmeans.train(xp)
+                centroids = torch.from_numpy(kmeans.centroids).to(x.device)  # convert back to torch tensor
+                return centroids
+            slots_list = []
+
+            for i in range(B):
+                centers = kmeans_faiss(h0_mapped[i], self.num_slots, niter=20)  # H*W, slot_size
+                # arr = h0_mapped[i].cpu().detach().numpy()                                # H*W, slot_size
+                # kmeans = KMeans(n_clusters=self.num_slots, random_state=42).fit(arr)
+                # centers = kmeans.cluster_centers_                                        # [num_slots, slot_size]
+                # centers_t = torch.from_numpy(centers).to(pre_feats.device)               # [num_slots, slot_size]
+                slots_list.append(centers)
+            slots = torch.stack(slots_list, dim=0)                                          # B, num_slots, slot_size
 
         # setup key and value
         inputs = self.norm_inputs(inputs)
@@ -157,19 +188,18 @@ class OneHotDictionary(nn.Module):
 class STEVEEncoder(nn.Module):
     def __init__(self, args):
         super().__init__()
-        
-        self.cnn1 = nn.Sequential(
-            Conv2dBlock(args.img_channels, args.cnn_hidden_size, 5, 1 if args.image_size == 64 else 2, 2),
-            Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
-            Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
-            conv2d(args.cnn_hidden_size, args.d_model, 5, 1, 2),
-        )
+
+        # self.cnn = nn.Sequential(
+        #     nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+        #     Conv2dBlock(args.vocab_size, args.cnn_hidden_size, 5, 1, 2),    #nn.Conv2d + relu()
+        #     Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
+        #     Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
+        #     conv2d(args.cnn_hidden_size, args.d_model, 5, 1, 2),
+        # )
 
         self.cnn = nn.Sequential(
-            Conv2dBlock(args.vocab_size, args.cnn_hidden_size, 5, 1, 2),    #nn.Conv2d + relu()
-            Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
-            Conv2dBlock(args.cnn_hidden_size, args.cnn_hidden_size, 5, 1, 2),
-            conv2d(args.cnn_hidden_size, args.d_model, 5, 1, 2),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            Conv2dBlock(args.vocab_size, args.d_model, 5, 1, 2),    #nn.Conv2d + relu()
         )
 
         self.pos = CartesianPositionalEmbedding(args.d_model, args.image_size if args.image_size == 64 else args.image_size // 2)
@@ -184,7 +214,7 @@ class STEVEEncoder(nn.Module):
         self.savi = SlotAttentionVideo(
             args.num_iterations, args.num_slots,
             args.d_model, args.slot_size, args.mlp_hidden_size,
-            args.num_predictor_blocks, args.num_predictor_heads, args.predictor_dropout)
+            args.num_predictor_blocks, args.num_predictor_heads, args.predictor_dropout, args.kmeans_init)
 
         self.slot_proj = linear(args.slot_size, args.d_model, bias=False)
 
@@ -321,6 +351,7 @@ class STEVE(nn.Module):
         self.image_size = args.image_size
         self.vocab_size = args.vocab_size
         self.d_model = args.d_model
+        self.use_dvae = args.use_dvae
 
         # dvae
         self.dvae = dVAE(args.vocab_size, args.img_channels)
@@ -335,25 +366,32 @@ class STEVE(nn.Module):
         self.backbone = CVCL_VISION_ENCODER()
 
         # deconv
-        self.deconvDVAE = Deconv(args, up_factor = 8)
-        self.deconvCNN = Deconv(args, up_factor = 16)
-
+        # self.deconvDVAE = Deconv(args, up_factor = 8)
+        # self.deconvCNN = Deconv(args, up_factor = 16)
+        
+        # MLPDecoder
+        self.mlp_decoder = MLPDecoder(
+            inp_dim=args.d_model,
+            outp_dim=args.vocab_size,
+            hidden_dims=[args.mlp_hidden_size],
+            n_patches=(args.image_size // 4) ** 2,
+            activation='relu',
+            eval_output_size=(args.image_size // 4, args.image_size // 4),
+            frozen=False
+        )
 
     def forward(self, video, tau, hard):
         B, T, C, H, W = video.size()
 
         video_flat = video.flatten(end_dim=1)                               # B * T, C, H, W
-        print(video_flat.shape)
-        cvcl_feats = self.backbone(video_flat)                            # B * T, 2048, 4, 4 
-        print(cvcl_feats.shape)
-        import sys
-        sys.exit(0)
+        cvcl_feats = self.backbone(video_flat)                            # B * T, 2048, 4, 4   ([72, 2048, 32, 32])
 
         # dvae encode
-        cvcl_dvae = self.deconvDVAE(cvcl_feats)                                  # B * T, 2048, 32, 32
-        # z_logits = F.log_softmax(self.dvae.encoder(video_flat), dim=1)       # B * T, vocab_size, H_enc, W_enc
-        z_logits = F.log_softmax(cvcl_dvae, dim=1)                           # B * T, vocab_size, H_enc, W_enc
-        # z_soft = gumbel_softmax(z_logits, tau, hard, dim=1)                  # B * T, vocab_size, H_enc, W_enc          soft one-hot codes 软离散码
+        if self.use_dvae:
+            z_logits = F.log_softmax(self.dvae.encoder(video_flat), dim=1)       # B * T, vocab_size, H_enc, W_enc
+        else:
+            z_logits = F.log_softmax(cvcl_feats, dim=1)                           # B * T, vocab_size, H_enc, W_enc
+        z_soft = gumbel_softmax(z_logits, tau, hard, dim=1)                  # B * T, vocab_size, H_enc, W_enc          soft one-hot codes 软离散码
         z_hard = gumbel_softmax(z_logits, tau, True, dim=1).detach()         # B * T, vocab_size, H_enc, W_enc          hard one-hot codes 硬离散码
         z_hard = z_hard.permute(0, 2, 3, 1).flatten(start_dim=1, end_dim=2)                         # B * T, H_enc * W_enc, vocab_size
         z_emb = self.steve_decoder.dict(z_hard)                                                     # B * T, H_enc * W_enc, d_model
@@ -361,15 +399,15 @@ class STEVE(nn.Module):
         z_emb = self.steve_decoder.pos(z_emb)                                                       # B * T, 1 + H_enc * W_enc, d_model      code embeddings
 
         # dvae recon
-        # dvae_recon = self.dvae.decoder(z_soft).reshape(B, T, C, H, W)               # B, T, C, H, W
-        # dvae_mse = ((video - dvae_recon) ** 2).sum() / (B * T)                      # 1
+        if self.use_dvae:
+            dvae_recon = self.dvae.decoder(z_soft).reshape(B, T, C, H, W)               # B, T, C, H, W
+            dvae_mse = ((video - dvae_recon) ** 2).sum() / (B * T)                      # 1
+        else:
+            dvae_mse = torch.tensor(0)
 
         # savi
-        cvcl_cnn = self.deconvCNN(cvcl_feats)         # B * T, 2048, 64, 64
-        emb = self.steve_encoder.cnn(cvcl_cnn)      # B * T, d_model, H/2, W/2
-        # emb = self.steve_encoder.cnn(video_flat)      # B * T, cnn_hidden_size, H, W
-        # emb = self.backbone(video_flat)
-        # emb = self.transition(emb) 
+        # cvcl_cnn = self.deconvCNN(cvcl_feats)         # B * T, 2048, 64, 64
+        emb = self.steve_encoder.cnn(cvcl_feats)      # B * T, d_model, H/2, W/2
         emb = self.steve_encoder.pos(emb)             # B * T, cnn_hidden_size, H, W
         H_enc, W_enc = emb.shape[-2:]
 
@@ -377,7 +415,7 @@ class STEVE(nn.Module):
         emb_set = self.steve_encoder.mlp(self.steve_encoder.layer_norm(emb_set))                            # B * T, H * W, cnn_hidden_size
         emb_set = emb_set.reshape(B, T, H_enc * W_enc, self.d_model)                                                # B, T, H * W, cnn_hidden_size
 
-        slots, attns = self.steve_encoder.savi(emb_set)         # slots: B, T, num_slots, slot_size
+        slots, attns = self.steve_encoder.savi(emb_set, cvcl_feats)         # slots: B, T, num_slots, slot_size
                                                                 # attns: B, T, num_slots, num_inputs
 
         attns = attns\
@@ -391,13 +429,14 @@ class STEVE(nn.Module):
         slots = self.steve_encoder.slot_proj(slots)                                                         # B, T, num_slots, d_model
         pred = self.steve_decoder.tf(z_emb[:, :-1], slots.flatten(end_dim=1))                               # B * T, H_enc * W_enc, d_model
         pred = self.steve_decoder.head(pred)                                                                # B * T, H_enc * W_enc, vocab_size
-        cross_entropy = -(z_hard * torch.log_softmax(pred, dim=-1)).sum() / (B * T)                         # 1
+        cross_entropy = -(z_hard * torch.log_softmax(pred, dim=-1)).sum() / (B * T)
+        
+        feats_recon = self.mlp_decoder(slots.flatten(end_dim=1))["reconstruction"]  # B * T, H_enc * W_enc, vocab_size
+        # recon_mse = F.mse_loss(feats_recon, cvcl_feats.flatten(start_dim=2).transpose(1,2), reduction='mean')  # MSE loss for reconstruction
+        recon_mse = F.mse_loss(feats_recon, cvcl_feats.flatten(start_dim=2).transpose(1,2), reduction='sum')
+        recon_mse = recon_mse / (B * T)  # average over batch and time
 
-        # return (dvae_recon.clamp(0., 1.),
-        #         cross_entropy,
-        #         dvae_mse,
-        #         attns)
-        return (None, cross_entropy, None, attns)
+        return (None, cross_entropy, dvae_mse, attns, recon_mse)
 
     def encode(self, video):
         B, T, C, H, W = video.size()
@@ -461,7 +500,7 @@ class STEVE(nn.Module):
 
         return recon_transformer
     
-    def visual_cvcl(self, video):
+    def visual_cvcl(self, video, name):
         B, T, C, H, W = video.size()
 
         video_flat = video.flatten(end_dim=1)                               # B * T, C, H, W
@@ -477,25 +516,68 @@ class STEVE(nn.Module):
         D, H, W = feat.shape
         feats = feat.view(D, -1).permute(1,0).cpu().numpy()  # shape = [1024,2048]
 
-        def kmeans_plus_plus(X, K):
-            # X: (N,D)
-            N, _ = X.shape
+        def kmeans(X, K, max_iters=50, tol=1e-6):
+            N, D = X.shape
             centers = []
-            # 随机选一个初始中心
-            idx = np.random.choice(N)
+            idx = np.random.randint(N)
             centers.append(X[idx])
             for _ in range(1, K):
-                # 计算每个点到已有 centers 的最小距离平方
                 d2 = np.min(cdist(X, np.stack(centers)), axis=1)
                 probs = d2 / d2.sum()
                 idx = np.random.choice(N, p=probs)
                 centers.append(X[idx])
-            return np.stack(centers)  # (K,D)
+            centers = np.stack(centers)  # [K, D]
+
+            for it in range(max_iters):
+                dists = cdist(X, centers)            # [N, K]
+                labels = np.argmin(dists, axis=1)    # [N]
+                # 更新
+                new_centers = np.zeros_like(centers)
+                for k in range(K):
+                    pts = X[labels == k]
+                    if len(pts) > 0:
+                        new_centers[k] = pts.mean(axis=0)
+                    else:
+                        # 若某簇空了，就随机补一个
+                        new_centers[k] = X[np.random.randint(N)]
+                # 检查收敛
+                shift = np.linalg.norm(new_centers - centers, axis=1).max()
+                centers = new_centers
+                if shift < tol:
+                    break
+
+            return labels, centers
+    
+        # def init_centers_max_distance(X, K):
+        #     N, D = X.shape
+        #     centers = []
+        #     idx = np.random.choice(N)
+        #     centers.append(X[idx])
+        #     for _ in range(1, K):
+        #         dists = cdist(X, np.stack(centers))      # (N, len(centers))
+        #         min_dists = np.min(dists, axis=1)        # (N,)
+        #         next_idx = np.argmax(min_dists)
+        #         centers.append(X[next_idx])
+        #     return np.stack(centers)  # (K, D)
+
+        # def kmeans_plus_plus(X, K):
+        #     N, _ = X.shape
+        #     centers = []
+        #     idx = np.random.choice(N)
+        #     centers.append(X[idx])
+        #     for _ in range(1, K):
+        #         # 计算每个点到已有 centers 的最小距离平方
+        #         d2 = np.min(cdist(X, np.stack(centers)), axis=1)
+        #         probs = d2 / d2.sum()
+        #         idx = np.random.choice(N, p=probs)
+        #         centers.append(X[idx])
+        #     return np.stack(centers)  # (K,D)
         
         K = 10
-        centers = kmeans_plus_plus(feats, K)
-        dists = cdist(feats, centers)  # shape = [1024, K]
-        labels = np.argmin(dists, axis=1)  # shape = [1024,]
+        labels, centers = kmeans(feats, K)
+        # centers = init_centers_max_distance(feats, K)
+        # dists = cdist(feats, centers)  # shape = [1024, K]
+        # labels = np.argmin(dists, axis=1)  # shape = [1024,]
         label_map = labels.reshape(H, W)
 
         label_up = np.repeat(np.repeat(label_map, 4, axis=0), 4, axis=1)
@@ -512,17 +594,18 @@ class STEVE(nn.Module):
         orig_img_pil = Image.fromarray(orig_uint8)
         overlay_pil  = Image.blend(orig_img_pil, Image.fromarray(colors_rgb), alpha=0.5)
 
+        w, h = orig_img_pil.size
+        combined = Image.new('RGB', (w * 3, h))
+        combined.paste(orig_img_pil,    (0,   0))
+        combined.paste(Image.fromarray(colors_rgb),     (w,   0))
+        combined.paste(overlay_pil,    (w * 2, 0))
+
         # 5. 保存
-        save_path = "/mnt/data/overlay_cluster_sample0.png"
+        save_path = f"/home/wz3008/baby_objectcentric/image/{name}.png"
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        overlay_pil.save(save_path)
+        # overlay_pil.save(save_path)
+        combined.save(save_path)
 
-        print(f"已将叠加可视化结果保存到：{save_path}")
+        print(f"svae to：{save_path}")
 
-        # plt.figure(figsize=(4,4))
-        # plt.imshow(label_map, cmap='tab20', interpolation='nearest')
-        # plt.axis('off')
-        # plt.title(f"Sample 0, K={K} 聚类结果")
-        # plt.savefig("/home/wz3008/baby_objectcentric/image/", dpi=300, bbox_inches='tight')
-        # plt.close() 
 

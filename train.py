@@ -16,11 +16,14 @@ from datetime import datetime
 from tqdm import *
 
 from steve import STEVE
+from steve_ori import STEVE_ORI
 from data import GlobVideoDataset, SAYCAMDataset
 from utils import cosine_anneal, linear_warmup
 
-# device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-device = torch.device('cpu')  # Force to use CPU for debugging
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cpu')  # Force CPU for debugging
+# print("CUDA available:", torch.cuda.is_available())
+# print("Current device:", torch.cuda.current_device(), torch.cuda.get_device_name(0))
 
 parser = argparse.ArgumentParser()
 
@@ -65,28 +68,36 @@ parser.add_argument('--tau_steps', type=int, default=30000)
 
 parser.add_argument('--hard', action='store_true')
 parser.add_argument('--use_dp', default=False, action='store_true')
-parser.add_argument('--local', default=False, action='store_true')
 parser.add_argument('--dev', default=False, action='store_true')
+# parser.add_argument('--cvcl_layer', type=int,default=1)
+parser.add_argument('--exp_name',type=str, default=None)
+parser.add_argument('--sgd', default=False, action='store_true')
+parser.add_argument('--kmeans_init', default=False, action='store_true')
+parser.add_argument('--use_dvae', default=False, action='store_true')
+parser.add_argument('--w', type=int, default=1)
 
 args = parser.parse_args()
+
+# layer1: 256, 32,32
+# layer2: 512, 16, 16
+# layer3: 1024, 8, 8
+# layer4: 2048, 4, 4
+# cvcl_feats_dict = {1:(256,32),2:(512,16),3:(1024,8),4:(2048,4)}
+# args.cvcl_feats = cvcl_feats_dict[args.cvcl_layer]
 
 torch.manual_seed(args.seed)
 
 arg_str_list = ['{}={}'.format(k, v) for k, v in vars(args).items()]
 arg_str = '__'.join(arg_str_list)
-log_dir = os.path.join(args.log_path, datetime.today().isoformat())
-writer = SummaryWriter(log_dir)
-writer.add_text('hparams', arg_str)
+if not args.dev:
+    log_dir = os.path.join(args.log_path, datetime.today().isoformat()+'_'+args.exp_name)
+    writer = SummaryWriter(log_dir)
+    writer.add_text('hparams', arg_str)
 
 # train_dataset = GlobVideoDataset(root=args.data_path, phase='train', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
 # val_dataset = GlobVideoDataset(root=args.data_path, phase='val', img_size=args.image_size, ep_len=args.ep_len, img_glob='????????_image.png')
-if not args.local:
-    train_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "train",128)
-    val_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "val",128)
-else:
-    DATA_DIR = "/mnt/wwn-0x5000c500e421004a/yy2694/datasets/train_5fps"
-    train_dataset = SAYCAMDataset(img_dir=DATA_DIR,json_path="/home/wz3008/steve/", phase="train",img_size=128)
-    val_dataset = SAYCAMDataset(img_dir=DATA_DIR,json_path="/home/wz3008/steve/", phase="val",img_size=128)
+train_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "train",128)
+val_dataset = SAYCAMDataset("saycam_transcript_5fps","/home/wz3008/steve/", "val",128)
 
 loader_kwargs = {
     'batch_size': args.batch_size,
@@ -127,15 +138,42 @@ if args.use_dp:
     optimizer = Adam([
         {'params': [p for n,p in model.module.named_parameters() if 'dvae' in n or 'deconvDVAE' in n], 'lr': args.lr_dvae},
         {'params': [p for n,p in model.module.named_parameters() if 'steve_encoder' in n or 'deconvCNN' in n], 'lr': args.lr_enc},
-        {'params': [p for n,p in model.module.named_parameters() if 'steve_decoder' in n], 'lr': args.lr_dec},
+        {'params': [p for n,p in model.module.named_parameters() if 'steve_decoder' in n or 'mlp_decoder' in n], 'lr': args.lr_dec},
     ])
 else:
     optimizer = Adam([
         {'params': [p for n,p in model.named_parameters() if 'dvae' in n or 'deconvDVAE' in n], 'lr': args.lr_dvae},
         {'params': [p for n,p in model.named_parameters() if 'steve_encoder' in n or 'deconvCNN' in n], 'lr': args.lr_enc},
-        {'params': [p for n,p in model.named_parameters() if 'steve_decoder' in n], 'lr': args.lr_dec},
+        {'params': [p for n,p in model.named_parameters() if 'steve_decoder' in n or 'mlp_decoder' in n], 'lr': args.lr_dec},
     ])
 model.to(device)
+
+# name_map = {p: n for n, p in model.named_parameters()}
+
+# for i, group in enumerate(optimizer.param_groups):
+#     print(f"\n=== Param group {i} (lr={group['lr']}) ===")
+#     names = [name_map.get(p, "<unk>") for p in group['params']]
+#     for n in names:
+#         print(" ", n)
+# import sys
+# sys.exit()
+
+# if args.sgd:
+#     optimizer = SGD([
+#         {'params': [p for n,p in model.named_parameters() if 'dvae' in n or 'deconvDVAE' in n], 'lr': args.lr_dvae},
+#         {'params': [p for n,p in model.named_parameters() if 'steve_encoder' in n or 'deconvCNN' in n], 'lr': args.lr_enc},
+#         {'params': [p for n,p in model.named_parameters() if 'steve_decoder' in n], 'lr': args.lr_dec},
+#     ],
+#     momentum=0.9,
+#     weight_decay=1e-4
+#     )
+# else:
+#     optimizer = Adam([
+#         {'params': [p for n,p in model.named_parameters() if 'dvae' in n or 'deconvDVAE' in n], 'lr': args.lr_dvae},
+#         {'params': [p for n,p in model.named_parameters() if 'steve_encoder' in n or 'deconvCNN' in n], 'lr': args.lr_enc},
+#         {'params': [p for n,p in model.named_parameters() if 'steve_decoder' in n], 'lr': args.lr_dec},
+#     ])
+
 
 if checkpoint is not None:
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -162,7 +200,7 @@ def visualize(video, recon_dvae, recon_tf, attns, N=8):
 
     return frames
 
-out_dir = "/home/wz3008/steve/visualize_frames"
+out_dir = "/scratch/wz3008/cvcl-related/steve_logs/visualize_frame"
 os.makedirs(out_dir, exist_ok=True)
 print("<=== Training Start ===>")
 print(f"start_epoch: {start_epoch}")
@@ -188,36 +226,28 @@ for epoch in tqdm(range(start_epoch, args.epochs)):
 
         optimizer.zero_grad()
         
-        (_, cross_entropy, _, attns) = model(video, tau, args.hard)
+        (_, cross_entropy, mse, attns, recon_mse) = model(video, tau, args.hard)
 
         if args.use_dp:
-            # mse = mse.mean()
+            mse = mse.mean()
             cross_entropy = cross_entropy.mean()
+            recon_mse = recon_mse.mean()
 
-        loss = cross_entropy
+        loss = mse + cross_entropy + args.w * recon_mse
         
         loss.backward()
         clip_grad_norm_(model.parameters(), args.clip, 'inf')
         optimizer.step()
         
         with torch.no_grad():
-            if batch % log_interval == 0:
-                # print('Train Epoch: {:3} [{:5}/{:5}] \t Loss: {:F} \t MSE: {:F}'.format(
-                #       epoch+1, batch, train_epoch_size, loss.item(), mse.item()))
-                
+            if batch % log_interval == 0 and not args.dev:
                 writer.add_scalar('TRAIN/loss', loss.item(), global_step)
-                # writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
-                # writer.add_scalar('TRAIN/mse', mse.item(), global_step)
-
-                # writer.add_scalar('TRAIN/tau', tau, global_step)
-                # writer.add_scalar('TRAIN/lr_dvae', optimizer.param_groups[0]['lr'], global_step)
-                # writer.add_scalar('TRAIN/lr_enc', optimizer.param_groups[1]['lr'], global_step)
-                # writer.add_scalar('TRAIN/lr_dec', optimizer.param_groups[2]['lr'], global_step)
-
+                writer.add_scalar('TRAIN/mse', mse.item(), global_step)
+                writer.add_scalar('TRAIN/cross_entropy', cross_entropy.item(), global_step)
+                writer.add_scalar('TRAIN/recon_mse', recon_mse.item(), global_step)
     
     # with torch.no_grad():
     #     frames = visualize(video, None, None, attns, N=8)
-    #     # writer.add_video('TRAIN_recons/epoch={:03}'.format(epoch+1), frames)
     #     for i, img in enumerate(frames):
     #         save_image(img, os.path.join(out_dir, f"epoch={(epoch+1):03}_frame_{i:02d}.png"))
     #         print(f"sve epoch={(epoch+1):03}_frame_{i:02d}.png to "+out_dir)
@@ -226,28 +256,33 @@ for epoch in tqdm(range(start_epoch, args.epochs)):
         model.eval()
 
         val_cross_entropy = 0.
-        # val_mse = 0.
+        val_mse = 0.
 
         for batch, video in enumerate(val_loader):
             video = video.to(device)
 
-            (_, cross_entropy, _, attns) = model(video, tau, args.hard)
+            (_, cross_entropy, mse, attns, recon_mse) = model(video, tau, args.hard)
 
             if args.use_dp:
-                # mse = mse.mean()
+                mse = mse.mean()
                 cross_entropy = cross_entropy.mean()
+                recon_mse = recon_mse.mean()
 
+            val_mse += mse.item()
             val_cross_entropy += cross_entropy.item()
-            # val_mse += mse.item()
+            val_recon_mse += recon_mse.item()
 
+        val_mse /= (val_epoch_size)
         val_cross_entropy /= (val_epoch_size)
-        # val_mse /= (val_epoch_size)
+        val_recon_mse /= (val_epoch_size)
 
-        val_loss = val_cross_entropy
+        val_loss = val_mse + val_cross_entropy + args.w * val_recon_mse
 
-        writer.add_scalar('VAL/loss', val_loss, epoch+1)
-        # writer.add_scalar('VAL/cross_entropy', val_cross_entropy, epoch + 1)
-        # writer.add_scalar('VAL/mse', val_mse, epoch+1)
+        if not args.dev:
+            writer.add_scalar('VAL/loss', val_loss, epoch+1)
+            writer.add_scalar('VAL/mse', val_mse, epoch+1)
+            writer.add_scalar('VAL/cross_entropy', val_cross_entropy, epoch + 1)
+            writer.add_scalar('VAL/recon_mse', val_recon_mse, epoch+1)
 
         print('====> Epoch: {:3} \t Loss = {:F}'.format(epoch+1, val_loss))
 
@@ -255,31 +290,33 @@ for epoch in tqdm(range(start_epoch, args.epochs)):
             best_val_loss = val_loss
             best_epoch = epoch + 1
 
-            torch.save(model.module.state_dict() if args.use_dp else model.state_dict(), os.path.join(log_dir, 'best_model.pt'))
+            if not args.dev:
+                torch.save(model.module.state_dict() if args.use_dp else model.state_dict(), os.path.join(log_dir, 'best_model.pt'))
 
-            # if global_step < args.steps:
-            #     torch.save(model.module.state_dict() if args.use_dp else model.state_dict(), os.path.join(log_dir, f'best_model_until_{args.steps}_steps_at_{epoch}.pt'))
+                # if global_step < args.steps:
+                #     torch.save(model.module.state_dict() if args.use_dp else model.state_dict(), os.path.join(log_dir, f'best_model_until_{args.steps}_steps_at_{epoch}.pt'))
 
-            if 50 <= epoch:
-                # gen_video = (model.module if args.use_dp else model).reconstruct_autoregressive(video[:8])
-                # frames = visualize(video, recon, gen_video, attns, N=8)
-                frames = visualize(video, None, None, attns, N=8)
-                # writer.add_video('VAL_recons/epoch={:03}'.format(epoch + 1), frames)
-                for i, img in enumerate(frames):
-                    save_image(img, os.path.join(out_dir, f"epoch={(epoch+1):03}_frame_{i:02d}.png"))
-                    # print(f"sve epoch={(epoch+1):03}_frame_{i:02d}.png to "+out_dir)
+                # if 50 <= epoch:
+                #     # gen_video = (model.module if args.use_dp else model).reconstruct_autoregressive(video[:8])
+                #     # frames = visualize(video, recon, gen_video, attns, N=8)
+                #     frames = visualize(video, None, None, attns, N=8)
+                #     # writer.add_video('VAL_recons/epoch={:03}'.format(epoch + 1), frames)
+                #     for i, img in enumerate(frames):
+                #         save_image(img, os.path.join(out_dir, f"epoch={(epoch+1):03}_frame_{i:02d}.png"))
+                #         # print(f"sve epoch={(epoch+1):03}_frame_{i:02d}.png to "+out_dir)
                 
-        writer.add_scalar('VAL/best_loss', best_val_loss, epoch+1)
+        if not args.dev:
+            writer.add_scalar('VAL/best_loss', best_val_loss, epoch+1)
 
-        checkpoint = {
-            'epoch': epoch + 1,
-            'best_val_loss': best_val_loss,
-            'best_epoch': best_epoch,
-            'model': model.module.state_dict() if args.use_dp else model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-        }
+            checkpoint = {
+                'epoch': epoch + 1,
+                'best_val_loss': best_val_loss,
+                'best_epoch': best_epoch,
+                'model': model.module.state_dict() if args.use_dp else model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+            }
 
-        torch.save(checkpoint, os.path.join(log_dir, 'checkpoint.pt.tar'))
+            torch.save(checkpoint, os.path.join(log_dir, 'checkpoint.pt.tar'))
 
         print('====> Best Loss = {:F} @ Epoch {}'.format(best_val_loss, best_epoch))
 

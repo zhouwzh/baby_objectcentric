@@ -531,16 +531,16 @@ class STEVE(nn.Module):
             for it in range(max_iters):
                 dists = cdist(X, centers)            # [N, K]
                 labels = np.argmin(dists, axis=1)    # [N]
-                # 更新
+                # 
                 new_centers = np.zeros_like(centers)
                 for k in range(K):
                     pts = X[labels == k]
                     if len(pts) > 0:
                         new_centers[k] = pts.mean(axis=0)
                     else:
-                        # 若某簇空了，就随机补一个
+                        # 
                         new_centers[k] = X[np.random.randint(N)]
-                # 检查收敛
+                # 
                 shift = np.linalg.norm(new_centers - centers, axis=1).max()
                 centers = new_centers
                 if shift < tol:
@@ -582,15 +582,15 @@ class STEVE(nn.Module):
 
         label_up = np.repeat(np.repeat(label_map, 4, axis=0), 4, axis=1)
 
-        # 2. 构造彩色覆盖图
+        # 2
         cmap = plt.get_cmap('tab20', K)
         colors = cmap(label_up)            # RGBA, shape = [128,128,4]
         colors_rgb = (colors[...,:3] * 255).astype(np.uint8)
 
-        # 3. 原图转 uint8
+        # 3
         orig_uint8 = (orig_img_np * 255).astype(np.uint8)
 
-        # 4. 用 PIL 叠加
+        # 4
         orig_img_pil = Image.fromarray(orig_uint8)
         overlay_pil  = Image.blend(orig_img_pil, Image.fromarray(colors_rgb), alpha=0.5)
 
@@ -600,12 +600,13 @@ class STEVE(nn.Module):
         combined.paste(Image.fromarray(colors_rgb),     (w,   0))
         combined.paste(overlay_pil,    (w * 2, 0))
 
-        # 5. 保存
+        # 5
         save_path = f"/home/wz3008/baby_objectcentric/image/{name}.png"
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         # overlay_pil.save(save_path)
         combined.save(save_path)
 
         print(f"svae to：{save_path}")
+        # 
 
 

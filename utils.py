@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple, Union
+
 
 def cosine_anneal(step, start_value, final_value, start_step, final_step):  #余弦退火：在 [start_step, final_step] 范围内平滑地从 start_value 退火到 final_value
 
@@ -115,3 +117,45 @@ def gru_cell(input_size, hidden_size, bias=True):
         nn.init.zeros_(m.bias_hh)
     
     return m
+
+def get_activation_fn(name_or_instance: Union[str, nn.Module]) -> nn.Module:
+    if isinstance(name_or_instance, nn.Module):
+        return name_or_instance
+    elif isinstance(name_or_instance, str):
+        if name_or_instance.lower() == "relu":
+            return nn.ReLU(inplace=True)
+        elif name_or_instance.lower() == "gelu":
+            return nn.GELU()
+        else:
+            raise ValueError(f"Unknown activation function {name_or_instance}")
+    else:
+        raise ValueError(
+            f"Unsupported type for activation function: {type(name_or_instance)}. "
+            "Can be `str` or `torch.nn.Module`."
+        )
+    
+def init_parameters(layers: Union[nn.Module, Iterable[nn.Module]], weight_init: str = "default"):
+    assert weight_init in ("default", "he_uniform", "he_normal", "xavier_uniform", "xavier_normal")
+    if isinstance(layers, nn.Module):
+        layers = [layers]
+
+    for idx, layer in enumerate(layers):
+        if hasattr(layer, "bias") and layer.bias is not None:
+            nn.init.zeros_(layer.bias)
+
+        if hasattr(layer, "weight") and layer.weight is not None:
+            gain = 1.0
+            if isinstance(layers, nn.Sequential):
+                if idx < len(layers) - 1:
+                    next = layers[idx + 1]
+                    if isinstance(next, nn.ReLU):
+                        gain = 2**0.5
+
+            if weight_init == "he_uniform":
+                torch.nn.init.kaiming_uniform_(layer.weight, gain)
+            elif weight_init == "he_normal":
+                torch.nn.init.kaiming_normal_(layer.weight, gain)
+            elif weight_init == "xavier_uniform":
+                torch.nn.init.xavier_uniform_(layer.weight, gain)
+            elif weight_init == "xavier_normal":
+                torch.nn.init.xavier_normal_(layer.weight, gain)
